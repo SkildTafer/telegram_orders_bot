@@ -1,387 +1,321 @@
 import os
 import logging
-from datetime import datetime, date
-from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
 from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+    Update, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardButton, InlineKeyboardMarkup,
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters,
 )
 
 load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-ALLOWED_SELLER_IDS_RAW = os.getenv("ALLOWED_SELLER_IDS", "").strip()
-EXCEL_FILE = Path(os.getenv("EXCEL_FILE", "orders.xlsx"))
-
 if not BOT_TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Заполните файл .env.")
+    raise RuntimeError("Environment variable BOT_TOKEN is not set")
 if not ADMIN_ID_RAW.isdigit():
-    raise RuntimeError("Не задан ADMIN_ID. Укажите числовой Telegram ID администратора.")
-
+    raise RuntimeError("ADMIN_ID must be your numeric Telegram user ID")
 ADMIN_ID = int(ADMIN_ID_RAW)
+
+SELLER_IDS_RAW = os.getenv("ALLOWED_SELLER_IDS", "").strip()
 ALLOWED_SELLER_IDS = {
-    int(value.strip())
-    for value in ALLOWED_SELLER_IDS_RAW.split(",")
+    int(value.strip()) for value in SELLER_IDS_RAW.split(",")
     if value.strip().isdigit()
 }
+# If no seller IDs are configured, any Telegram user can submit an order.
+# Admin-only actions remain restricted to ADMIN_ID.
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-(
-    DATE_STATE, TT_NUMBER_STATE, ADDRESS_STATE, SIM_SERIAL_STATE,
-    SIM_PHONE_STATE, AMOUNT_STATE, EMPLOYEE_STATE, CONFIRM_STATE
-) = range(8)
-
+DATA_FILE = Path(os.getenv("ORDERS_FILE", "orders.xlsx"))
 HEADERS = [
-    "ID заказа", "Дата заказа", "Номер торговой точки",
-    "Адрес торговой точки", "Серийный номер SIM-карты",
-    "Номер SIM-карты", "Сумма заказа", "Сотрудник, который продал",
-    "Кто внёс заказ (Telegram ID)", "Дата и время внесения"
+    "ID", "Дата заказа", "Номер ТТ", "Адрес ТТ", "Серийный номер SIM",
+    "Номер телефона SIM", "Сумма заказа", "Продавец", "Telegram ID продавца",
+    "Создано",
 ]
+
+DATE, OUTLET_NUMBER, OUTLET_ADDRESS, SIM_SERIAL, SIM_PHONE, AMOUNT, SELLER = range(7)
+CANCEL_TEXT = "❌ Отмена"
+ADMIN_MENU_TEXT = "🛠 Панель администратора"
+NEW_ORDER_TEXT = "➕ Добавить заказ"
+
+
+def ensure_workbook():
+    if not DATA_FILE.exists():
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Заказы"
+        ws.append(HEADERS)
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = "A1:J1"
+        wb.save(DATA_FILE)
+
+
+def get_sheet():
+    ensure_workbook()
+    wb = load_workbook(DATA_FILE)
+    ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
+    return wb, ws
+
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
-def is_allowed_seller(user_id: int) -> bool:
-    # Если список продавцов пустой, любой пользователь, открывший личный чат с ботом,
-    # может вносить заказы. Для строгого доступа заполните ALLOWED_SELLER_IDS в .env.
-    return user_id == ADMIN_ID or not ALLOWED_SELLER_IDS or user_id in ALLOWED_SELLER_IDS
 
-def ensure_workbook():
-    if EXCEL_FILE.exists():
-        return
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Заказы"
-    ws.append(HEADERS)
-    style_sheet(ws)
-    wb.save(EXCEL_FILE)
+def can_submit(user_id: int) -> bool:
+    return is_admin(user_id) or not ALLOWED_SELLER_IDS or user_id in ALLOWED_SELLER_IDS
 
-def style_sheet(ws):
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-        cell.alignment = Alignment(vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 32
-    widths = [12, 15, 20, 32, 28, 22, 16, 28, 25, 24]
-    for idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = width
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-def append_order(order: dict, telegram_id: int) -> int:
-    ensure_workbook()
-    wb = load_workbook(EXCEL_FILE)
-    ws = wb["Заказы"] if "Заказы" in wb.sheetnames else wb.active
-    order_id = max(1, ws.max_row)  # Header is row 1, so first order ID is 1.
-    created_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    ws.append([
-        order_id,
-        order["date"],
-        order["tt_number"],
-        order["address"],
-        order["sim_serial"],
-        order["sim_phone"],
-        float(order["amount"]),
-        order["employee"],
-        telegram_id,
-        created_at,
-    ])
-    style_sheet(ws)
-    wb.save(EXCEL_FILE)
-    return order_id
 
 def main_keyboard(user_id: int):
-    rows = [[KeyboardButton("➕ Добавить заказ")]]
+    rows = [[KeyboardButton(NEW_ORDER_TEXT)]]
     if is_admin(user_id):
-        rows.append([KeyboardButton("📥 Выгрузить Excel"), KeyboardButton("📋 Последние заказы")])
+        rows.append([KeyboardButton(ADMIN_MENU_TEXT)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def admin_inline_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Последние заказы", callback_data="admin_recent")],
+        [InlineKeyboardButton("📤 Скачать Excel", callback_data="admin_export")],
+        [InlineKeyboardButton("🧹 Очистить все заказы", callback_data="admin_clear_ask")],
+    ])
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not update.effective_chat or update.effective_chat.type != "private":
-        await update.message.reply_text("Пожалуйста, используйте бота в личном чате.")
+    if not can_submit(user.id):
+        await update.message.reply_text("У вас нет доступа к этому боту. Обратитесь к администратору.")
         return
-    if not is_allowed_seller(user.id):
-        await update.message.reply_text("У вас нет доступа к внесению заказов. Обратитесь к администратору.")
-        return
-    text = (
-        "Привет! Здесь можно зарегистрировать продажу.\n\n"
-        "Нажмите «➕ Добавить заказ». Продавцы могут добавлять записи, "
-        "а просматривать и выгружать все заказы может только администратор."
-    )
+    text = "Привет! Здесь можно зарегистрировать заказ SIM-карты."
     if is_admin(user.id):
-        text += "\n\nКоманды администратора: /export — Excel, /orders — последние записи."
+        text += "\nУ тебя также есть панель администратора."
     await update.message.reply_text(text, reply_markup=main_keyboard(user.id))
 
-async def new_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_allowed_seller(user.id):
-        await update.message.reply_text("У вас нет доступа к внесению заказов.")
-        return ConversationHandler.END
-    context.user_data["order"] = {}
-    context.user_data["order"]["date"] = date.today().strftime("%d.%m.%Y")
-    keyboard = [["✅ Сегодня", "✏️ Ввести другую дату"], ["❌ Отмена"]]
-    await update.message.reply_text(
-        f"Дата заказа по умолчанию: {context.user_data['order']['date']}.\n"
-        "Оставить сегодняшнюю дату или ввести другую?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-    )
-    return DATE_STATE
 
-async def choose_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer = update.message.text.strip()
-    if answer == "❌ Отмена":
+async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта панель доступна только администратору.")
+        return
+    await update.message.reply_text("🛠 Панель администратора\nВыбери действие:", reply_markup=admin_inline_keyboard())
+
+
+async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not can_submit(update.effective_user.id):
+        await update.message.reply_text("У вас нет доступа к добавлению заказов.")
+        return ConversationHandler.END
+    context.user_data["order"] = {"date": date.today().strftime("%d.%m.%Y")}
+    keyboard = ReplyKeyboardMarkup(
+        [[KeyboardButton("Сегодня"), KeyboardButton("Изменить дату")], [KeyboardButton(CANCEL_TEXT)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        f"Дата заказа: {context.user_data['order']['date']}\nНажми «Сегодня» или измени дату в формате ДД.ММ.ГГГГ.",
+        reply_markup=keyboard,
+    )
+    return DATE
+
+
+async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    value = update.message.text.strip()
+    if value == CANCEL_TEXT:
         return await cancel(update, context)
-    if answer == "✅ Сегодня":
-        pass
-    elif answer == "✏️ Ввести другую дату":
-        await update.message.reply_text(
-            "Введите дату в формате ДД.ММ.ГГГГ, например 19.10.2026.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        context.user_data["waiting_custom_date"] = True
-        return DATE_STATE
+    if value == "Сегодня":
+        context.user_data["order"]["date"] = date.today().strftime("%d.%m.%Y")
+    elif value == "Изменить дату":
+        await update.message.reply_text("Введи дату в формате ДД.ММ.ГГГГ, например 20.10.2026.")
+        return DATE
     else:
         try:
-            datetime.strptime(answer, "%d.%m.%Y")
-            context.user_data["order"]["date"] = answer
-            context.user_data.pop("waiting_custom_date", None)
+            parsed = datetime.strptime(value, "%d.%m.%Y").date()
+            context.user_data["order"]["date"] = parsed.strftime("%d.%m.%Y")
         except ValueError:
-            await update.message.reply_text("Не понял дату. Используйте ДД.ММ.ГГГГ или кнопки ниже.")
-            return DATE_STATE
-    if context.user_data.pop("waiting_custom_date", False):
-        pass
-    await update.message.reply_text("Введите номер торговой точки:", reply_markup=ReplyKeyboardRemove())
-    return TT_NUMBER_STATE
+            await update.message.reply_text("Не понял дату. Введи её в формате ДД.ММ.ГГГГ или нажми «Сегодня».")
+            return DATE
+    await update.message.reply_text("Введи номер торговой точки (ТТ).", reply_markup=ReplyKeyboardMarkup([[KeyboardButton(CANCEL_TEXT)]], resize_keyboard=True))
+    return OUTLET_NUMBER
 
-async def tt_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-    if value == "❌ Отмена":
+
+async def receive_outlet_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
         return await cancel(update, context)
-    if not value:
-        await update.message.reply_text("Номер торговой точки не должен быть пустым. Введите номер:")
-        return TT_NUMBER_STATE
-    context.user_data["order"]["tt_number"] = value
-    await update.message.reply_text("Введите адрес торговой точки:")
-    return ADDRESS_STATE
+    context.user_data["order"]["outlet_number"] = update.message.text.strip()
+    await update.message.reply_text("Введи адрес торговой точки.")
+    return OUTLET_ADDRESS
 
-async def address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-    if not value:
-        await update.message.reply_text("Адрес не должен быть пустым. Введите адрес:")
-        return ADDRESS_STATE
-    context.user_data["order"]["address"] = value
-    await update.message.reply_text("Введите серийный номер SIM-карты:")
-    return SIM_SERIAL_STATE
 
-async def sim_serial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-    if not value:
-        await update.message.reply_text("Серийный номер не должен быть пустым. Введите его:")
-        return SIM_SERIAL_STATE
-    context.user_data["order"]["sim_serial"] = value
-    await update.message.reply_text("Введите номер SIM-карты (номер телефона):")
-    return SIM_PHONE_STATE
+async def receive_outlet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
+        return await cancel(update, context)
+    context.user_data["order"]["outlet_address"] = update.message.text.strip()
+    await update.message.reply_text("Введи серийный номер SIM-карты.")
+    return SIM_SERIAL
 
-async def sim_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-    if not value:
-        await update.message.reply_text("Номер SIM-карты не должен быть пустым. Введите его:")
-        return SIM_PHONE_STATE
-    context.user_data["order"]["sim_phone"] = value
-    await update.message.reply_text("Введите сумму заказа, например 1500 или 1500,50:")
-    return AMOUNT_STATE
 
-async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    raw = update.message.text.strip().replace("₽", "").replace(" ", "").replace(",", ".")
-    try:
-        value = Decimal(raw)
-        if value <= 0 or not value.is_finite():
-            raise InvalidOperation
-    except (InvalidOperation, ValueError):
-        await update.message.reply_text("Введите положительную сумму числом, например 1500 или 1500,50.")
-        return AMOUNT_STATE
-    context.user_data["order"]["amount"] = value
-    await update.message.reply_text("Введите имя и фамилию сотрудника, который продал:")
-    return EMPLOYEE_STATE
+async def receive_sim_serial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
+        return await cancel(update, context)
+    context.user_data["order"]["sim_serial"] = update.message.text.strip()
+    await update.message.reply_text("Введи номер телефона SIM-карты.")
+    return SIM_PHONE
 
-async def employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    value = update.message.text.strip()
-    if not value:
-        await update.message.reply_text("Укажите сотрудника, который продал:")
-        return EMPLOYEE_STATE
-    context.user_data["order"]["employee"] = value
+
+async def receive_sim_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
+        return await cancel(update, context)
+    context.user_data["order"]["sim_phone"] = update.message.text.strip()
+    await update.message.reply_text("Введи сумму заказа (только число или сумму с валютой).")
+    return AMOUNT
+
+
+async def receive_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
+        return await cancel(update, context)
+    context.user_data["order"]["amount"] = update.message.text.strip()
+    await update.message.reply_text("Введи имя продавца.")
+    return SELLER
+
+
+async def receive_seller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() == CANCEL_TEXT:
+        return await cancel(update, context)
     order = context.user_data["order"]
-    summary = (
-        "Проверьте заказ перед сохранением:\n\n"
-        f"Дата: {order['date']}\n"
-        f"Номер торговой точки: {order['tt_number']}\n"
-        f"Адрес: {order['address']}\n"
-        f"Серийный номер SIM-карты: {order['sim_serial']}\n"
-        f"Номер SIM-карты: {order['sim_phone']}\n"
-        f"Сумма: {order['amount']} ₽\n"
-        f"Сотрудник: {order['employee']}\n\n"
-        "Сохранить заказ?"
-    )
-    keyboard = [["✅ Сохранить", "✏️ Заполнить заново"], ["❌ Отмена"]]
-    await update.message.reply_text(
-        summary,
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True),
-    )
-    return CONFIRM_STATE
-
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer = update.message.text.strip()
-    if answer == "❌ Отмена":
-        return await cancel(update, context)
-    if answer == "✏️ Заполнить заново":
-        return await new_order(update, context)
-    if answer != "✅ Сохранить":
-        await update.message.reply_text("Выберите кнопку: сохранить, заполнить заново или отменить.")
-        return CONFIRM_STATE
-    order = context.user_data.get("order")
-    if not order:
-        await update.message.reply_text("Черновик не найден. Нажмите «Добавить заказ».", reply_markup=main_keyboard(update.effective_user.id))
-        return ConversationHandler.END
+    order["seller"] = update.message.text.strip()
+    user = update.effective_user
     try:
-        order_id = append_order(order, update.effective_user.id)
-    except PermissionError:
-        logger.exception("Не удалось записать Excel-файл: файл может быть открыт в Excel.")
-        await update.message.reply_text(
-            "Не удалось записать файл. Возможно, orders.xlsx открыт на компьютере. "
-            "Закройте файл и попробуйте ещё раз."
-        )
-        return CONFIRM_STATE
+        wb, ws = get_sheet()
+        order_id = max(1, ws.max_row)
+        ws.append([
+            order_id, order["date"], order["outlet_number"], order["outlet_address"],
+            order["sim_serial"], order["sim_phone"], order["amount"], order["seller"],
+            user.id, datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        ])
+        wb.save(DATA_FILE)
     except Exception:
-        logger.exception("Ошибка сохранения заказа")
-        await update.message.reply_text("Произошла ошибка при сохранении. Сообщите администратору.")
-        return CONFIRM_STATE
+        logger.exception("Could not save order")
+        await update.message.reply_text("Не удалось сохранить заказ. Попробуй позже или сообщи администратору.", reply_markup=main_keyboard(user.id))
+        context.user_data.pop("order", None)
+        return ConversationHandler.END
 
-    # Send a notification to the administrator without exposing the order to other sellers.
-    if update.effective_user.id != ADMIN_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"🆕 Новый заказ №{order_id}\n"
-                    f"Дата: {order['date']}\n"
-                    f"ТТ: {order['tt_number']} — {order['address']}\n"
-                    f"Сумма: {order['amount']} ₽\n"
-                    f"Сотрудник: {order['employee']}"
-                ),
-            )
-        except Exception:
-            logger.exception("Не удалось отправить уведомление администратору")
-    context.user_data.pop("order", None)
-    await update.message.reply_text(
-        f"✅ Заказ №{order_id} сохранён.",
-        reply_markup=main_keyboard(update.effective_user.id),
+    summary = (
+        "✅ Заказ сохранён!\n\n"
+        f"Дата: {order['date']}\nТТ: {order['outlet_number']}\nАдрес: {order['outlet_address']}\n"
+        f"Серийный номер SIM: {order['sim_serial']}\nТелефон SIM: {order['sim_phone']}\n"
+        f"Сумма: {order['amount']}\nПродавец: {order['seller']}"
     )
+    await update.message.reply_text(summary, reply_markup=main_keyboard(user.id))
+    context.user_data.pop("order", None)
     return ConversationHandler.END
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("order", None)
-    context.user_data.pop("waiting_custom_date", None)
-    await update.message.reply_text(
-        "Внесение заказа отменено.",
-        reply_markup=main_keyboard(update.effective_user.id),
-    )
+    await update.message.reply_text("Добавление заказа отменено.", reply_markup=main_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
-async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Эта команда доступна только администратору.")
-        return
-    ensure_workbook()
-    await update.message.reply_document(
-        document=EXCEL_FILE.open("rb"),
-        filename=EXCEL_FILE.name,
-        caption="Все сохранённые заказы."
-    )
 
-async def recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Эта команда доступна только администратору.")
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("Недостаточно прав.")
         return
-    ensure_workbook()
-    wb = load_workbook(EXCEL_FILE, read_only=True, data_only=True)
-    ws = wb["Заказы"]
-    rows = list(ws.iter_rows(min_row=2, values_only=True))
-    wb.close()
-    if not rows:
-        await update.message.reply_text("Пока заказов нет.")
-        return
-    lines = ["Последние заказы:"]
-    for row in rows[-10:][::-1]:
-        lines.append(
-            f"№{row[0]} | {row[1]} | ТТ {row[2]} | {row[6]} ₽ | {row[7]}"
+
+    if query.data == "admin_clear_ask":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚠️ Да, удалить все заказы", callback_data="admin_clear_confirm")],
+            [InlineKeyboardButton("↩️ Отмена", callback_data="admin_back")],
+        ])
+        await query.edit_message_text(
+            "⚠️ Ты точно хочешь удалить ВСЕ заказы из Excel-файла?\n\n"
+            "Это действие нельзя отменить. Заголовки столбцов останутся.",
+            reply_markup=keyboard,
         )
-    await update.message.reply_text("\n".join(lines))
+    elif query.data == "admin_clear_confirm":
+        try:
+            wb, ws = get_sheet()
+            if ws.max_row > 1:
+                ws.delete_rows(2, ws.max_row - 1)
+            ws.auto_filter.ref = "A1:J1"
+            wb.save(DATA_FILE)
+            await query.edit_message_text("🧹 Все заказы удалены. Заголовки таблицы сохранены.", reply_markup=admin_inline_keyboard())
+        except Exception:
+            logger.exception("Could not clear orders")
+            await query.edit_message_text("Не удалось очистить файл. Проверь логи приложения.", reply_markup=admin_inline_keyboard())
+    elif query.data == "admin_recent":
+        try:
+            _, ws = get_sheet()
+            rows = list(ws.iter_rows(min_row=2, values_only=True))
+            if not rows:
+                text = "Заказов пока нет."
+            else:
+                lines = []
+                for row in rows[-10:][::-1]:
+                    # ID, date, outlet, address, serial, phone, amount, seller, telegram ID, created
+                    lines.append(f"#{row[0]} · {row[1]} · ТТ {row[2]} · {row[6]} · {row[7]}")
+                text = "📋 Последние заказы (до 10):\n\n" + "\n".join(lines)
+            await query.edit_message_text(text, reply_markup=admin_inline_keyboard())
+        except Exception:
+            logger.exception("Could not read orders")
+            await query.edit_message_text("Не удалось прочитать заказы.", reply_markup=admin_inline_keyboard())
+    elif query.data == "admin_export":
+        try:
+            ensure_workbook()
+            with open(DATA_FILE, "rb") as f:
+                await query.message.reply_document(document=f, filename=DATA_FILE.name, caption="📤 Файл с заказами")
+            await query.edit_message_text("Файл Excel отправлен выше.", reply_markup=admin_inline_keyboard())
+        except Exception:
+            logger.exception("Could not export orders")
+            await query.edit_message_text("Не удалось отправить Excel-файл.", reply_markup=admin_inline_keyboard())
+    elif query.data == "admin_back":
+        await query.edit_message_text("🛠 Панель администратора", reply_markup=admin_inline_keyboard())
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text_value = update.message.text.strip()
-    if not is_allowed_seller(user_id):
-        await update.message.reply_text("У вас нет доступа к этому боту.")
+
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Эта команда доступна только администратору.")
         return
-    if text_value == "➕ Добавить заказ":
-        await new_order(update, context)
-    elif text_value == "📥 Выгрузить Excel":
-        await export_excel(update, context)
-    elif text_value == "📋 Последние заказы":
-        await recent_orders(update, context)
-    else:
-        await update.message.reply_text("Используйте кнопки меню или команду /start.")
+    await admin_menu(update, context)
+
 
 def main():
     ensure_workbook()
     app = Application.builder().token(BOT_TOKEN).build()
-
     conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("new", new_order),
-            MessageHandler(filters.Regex(r"^➕ Добавить заказ$"), new_order),
+            CommandHandler("neworder", order_start),
+            MessageHandler(filters.Regex(f"^{NEW_ORDER_TEXT}$"), order_start),
         ],
         states={
-            DATE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_date)],
-            TT_NUMBER_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_number)],
-            ADDRESS_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, address)],
-            SIM_SERIAL_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sim_serial)],
-            SIM_PHONE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sim_phone)],
-            AMOUNT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, amount)],
-            EMPLOYEE_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, employee)],
-            CONFIRM_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+            DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
+            OUTLET_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outlet_number)],
+            OUTLET_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_outlet_address)],
+            SIM_SERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_sim_serial)],
+            SIM_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_sim_phone)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount)],
+            SELLER: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_seller)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(f"^{CANCEL_TEXT}$"), cancel)],
         allow_reentry=True,
     )
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("export", export_excel))
-    app.add_handler(CommandHandler("orders", recent_orders))
+    app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(MessageHandler(filters.Regex(f"^{ADMIN_MENU_TEXT}$"), admin_menu))
     app.add_handler(conversation)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    logger.info("Бот запущен.")
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
+    logger.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
