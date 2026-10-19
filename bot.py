@@ -38,8 +38,7 @@ ADMIN_IDS = {
 }
 SELLER_IDS_RAW = os.getenv("ALLOWED_SELLER_IDS", "").strip()
 ALLOWED_SELLER_IDS = {
-    int(value.strip())
-    for value in SELLER_IDS_RAW.split(",")
+    int(value.strip()) for value in SELLER_IDS_RAW.split(",")
     if value.strip().isdigit()
 }
 
@@ -47,45 +46,24 @@ if not BOT_TOKEN:
     raise RuntimeError("Environment variable BOT_TOKEN is not set")
 if not ADMIN_IDS:
     raise RuntimeError(
-        "Укажите хотя бы один числовой Telegram ID в переменной ADMIN_ID. "
+        "Укажите хотя бы один числовой Telegram ID в ADMIN_ID. "
         "Несколько ID разделяются запятой."
     )
 
 EXCEL_FILE = os.getenv("EXCEL_FILE", "orders.xlsx")
 HEADERS = [
-    "ID заказа",
-    "Дата заказа",
-    "Номер торговой точки",
-    "Адрес торговой точки",
-    "Серийный номер SIM",
-    "Номер телефона SIM",
-    "Сумма заказа",
-    "Продавец",
-    "Telegram ID автора",
-    "Время создания",
+    "ID заказа", "Дата заказа", "Номер торговой точки", "Адрес торговой точки",
+    "Серийный номер SIM", "Номер телефона SIM", "Сумма заказа", "Продавец",
+    "Telegram ID автора", "Время создания",
 ]
 
-(
-    ORDER_DATE,
-    OUTLET_NUMBER,
-    OUTLET_ADDRESS,
-    SIM_SERIAL,
-    SIM_PHONE,
-    ORDER_AMOUNT,
-    SELLER_NAME,
-    CONFIRM_ORDER,
-) = range(8)
+(ORDER_DATE, OUTLET_NUMBER, OUTLET_ADDRESS, SIM_SERIAL, SIM_PHONE,
+ ORDER_AMOUNT, SELLER_NAME, CONFIRM_ORDER) = range(8)
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["➕ Добавить заказ"]],
-    resize_keyboard=True,
-)
+MAIN_KEYBOARD = ReplyKeyboardMarkup([["➕ Добавить заказ"]], resize_keyboard=True)
 ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["➕ Добавить заказ"],
-        ["📋 Последние заказы", "📥 Скачать Excel"],
-        ["🗑 Очистить все заказы"],
-    ],
+    [["➕ Добавить заказ"], ["📋 Последние заказы", "📥 Скачать Excel"],
+     ["🗑 Очистить все заказы"]],
     resize_keyboard=True,
 )
 CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True)
@@ -110,8 +88,9 @@ def ensure_workbook():
         ws.title = "Заказы"
         ws.append(HEADERS)
         ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:J1"
+        ws.auto_filter.ref = "A1:J1"
         wb.save(EXCEL_FILE)
+        wb.close()
 
 
 def read_orders():
@@ -127,10 +106,11 @@ def append_order(values):
     ensure_workbook()
     wb = load_workbook(EXCEL_FILE)
     ws = wb.active
-    next_id = max(
-        [int(row[0]) for row in ws.iter_rows(min_row=2, max_col=1, values_only=True)
-         if row[0] is not None and str(row[0]).isdigit()] or [0]
-    ) + 1
+    ids = [
+        int(row[0]) for row in ws.iter_rows(min_row=2, max_col=1, values_only=True)
+        if row[0] is not None and str(row[0]).isdigit()
+    ]
+    next_id = max(ids or [0]) + 1
     ws.append([next_id] + values)
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
@@ -151,42 +131,40 @@ def clear_orders():
 
 
 def format_order(row):
-    # row is a tuple in Excel column order
     return (
-        f"Заказ №{row[0]}\n"
-        f"Дата: {row[1]}\n"
-        f"Точка: {row[2]}\n"
-        f"Адрес: {row[3]}\n"
-        f"Серийный номер SIM: {row[4]}\n"
-        f"Номер телефона SIM: {row[5]}\n"
-        f"Сумма: {row[6]}\n"
-        f"Продавец: {row[7]}\n"
-        f"Telegram ID автора: {row[8]}\n"
-        f"Создан: {row[9]}"
+        f"Заказ №{row[0]}\nДата: {row[1]}\nТочка: {row[2]}\nАдрес: {row[3]}\n"
+        f"Серийный номер SIM: {row[4]}\nНомер телефона SIM: {row[5]}\n"
+        f"Сумма: {row[6]}\nПродавец: {row[7]}\n"
+        f"Telegram ID автора: {row[8]}\nСоздан: {row[9]}"
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_allowed_seller(user.id):
-        await update.message.reply_text(
-            "У вас нет доступа к этому боту. Обратитесь к администратору."
-        )
+        await update.message.reply_text("У вас нет доступа к этому боту. Обратитесь к администратору.")
         return
     role = "администратор" if is_admin(user.id) else "продавец"
     await update.message.reply_text(
-        f"Привет! Вы вошли как {role}.\n"
-        "Нажмите «➕ Добавить заказ», чтобы внести новый заказ.",
+        f"Привет! Вы вошли как {role}.\nНажмите «➕ Добавить заказ», чтобы внести новый заказ.",
         reply_markup=get_main_keyboard(user.id),
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("new_order", None)
-    await update.message.reply_text(
-        "Ввод заказа отменён.",
-        reply_markup=get_main_keyboard(update.effective_user.id),
-    )
+    # Works for either the reply-keyboard button or /cancel command.
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Ввод заказа отменён.")
+        await update.callback_query.message.reply_text(
+            "Выберите действие:", reply_markup=get_main_keyboard(update.effective_user.id)
+        )
+    elif update.message:
+        await update.message.reply_text(
+            "Ввод заказа отменён.",
+            reply_markup=get_main_keyboard(update.effective_user.id),
+        )
     return ConversationHandler.END
 
 
@@ -195,12 +173,12 @@ async def begin_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_seller(user.id):
         await update.message.reply_text("У вас нет доступа к добавлению заказов.")
         return ConversationHandler.END
-    context.user_data["new_order"] = {}
-    context.user_data["new_order"]["telegram_id"] = user.id
-    context.user_data["new_order"]["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    context.user_data["new_order"] = {
+        "telegram_id": user.id,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
     await update.message.reply_text(
-        f"Введите дату заказа в формате ДД.ММ.ГГГГ.\n"
-        f"Сегодня: {date.today().strftime('%d.%m.%Y')}\n"
+        f"Введите дату заказа в формате ДД.ММ.ГГГГ.\nСегодня: {date.today().strftime('%d.%m.%Y')}\n"
         "Можно отправить «сегодня».",
         reply_markup=CANCEL_KEYBOARD,
     )
@@ -218,47 +196,47 @@ async def order_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не понял дату. Введите ДД.ММ.ГГГГ, например 20.10.2026.")
             return ORDER_DATE
     context.user_data["new_order"]["date"] = parsed.strftime("%d.%m.%Y")
-    await update.message.reply_text("Введите номер торговой точки:")
+    await update.message.reply_text("Введите номер торговой точки:", reply_markup=CANCEL_KEYBOARD)
     return OUTLET_NUMBER
 
 
 async def outlet_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     if not value:
-        await update.message.reply_text("Поле не должно быть пустым. Введите номер торговой точки:")
+        await update.message.reply_text("Введите номер торговой точки:", reply_markup=CANCEL_KEYBOARD)
         return OUTLET_NUMBER
     context.user_data["new_order"]["outlet_number"] = value
-    await update.message.reply_text("Введите адрес торговой точки:")
+    await update.message.reply_text("Введите адрес торговой точки:", reply_markup=CANCEL_KEYBOARD)
     return OUTLET_ADDRESS
 
 
 async def outlet_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     if not value:
-        await update.message.reply_text("Поле не должно быть пустым. Введите адрес торговой точки:")
+        await update.message.reply_text("Введите адрес торговой точки:", reply_markup=CANCEL_KEYBOARD)
         return OUTLET_ADDRESS
     context.user_data["new_order"]["outlet_address"] = value
-    await update.message.reply_text("Введите серийный номер SIM-карты:")
+    await update.message.reply_text("Введите серийный номер SIM-карты:", reply_markup=CANCEL_KEYBOARD)
     return SIM_SERIAL
 
 
 async def sim_serial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     if not value:
-        await update.message.reply_text("Поле не должно быть пустым. Введите серийный номер SIM:")
+        await update.message.reply_text("Введите серийный номер SIM:", reply_markup=CANCEL_KEYBOARD)
         return SIM_SERIAL
     context.user_data["new_order"]["sim_serial"] = value
-    await update.message.reply_text("Введите номер телефона SIM-карты:")
+    await update.message.reply_text("Введите номер телефона SIM-карты:", reply_markup=CANCEL_KEYBOARD)
     return SIM_PHONE
 
 
 async def sim_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     if not value:
-        await update.message.reply_text("Поле не должно быть пустым. Введите номер телефона SIM:")
+        await update.message.reply_text("Введите номер телефона SIM:", reply_markup=CANCEL_KEYBOARD)
         return SIM_PHONE
     context.user_data["new_order"]["sim_phone"] = value
-    await update.message.reply_text("Введите сумму заказа (например, 1500 или 1500.50):")
+    await update.message.reply_text("Введите сумму заказа (например, 1500 или 1500.50):", reply_markup=CANCEL_KEYBOARD)
     return ORDER_AMOUNT
 
 
@@ -269,36 +247,31 @@ async def order_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if amount < 0:
             raise InvalidOperation
     except (InvalidOperation, ValueError):
-        await update.message.reply_text("Введите сумму числом, например 1500 или 1500.50:")
+        await update.message.reply_text("Введите сумму числом, например 1500 или 1500.50:", reply_markup=CANCEL_KEYBOARD)
         return ORDER_AMOUNT
     context.user_data["new_order"]["amount"] = str(amount)
-    await update.message.reply_text("Введите имя или фамилию продавца:")
+    await update.message.reply_text("Введите имя или фамилию продавца:", reply_markup=CANCEL_KEYBOARD)
     return SELLER_NAME
 
 
 async def seller_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
     if not value:
-        await update.message.reply_text("Поле не должно быть пустым. Введите имя продавца:")
+        await update.message.reply_text("Введите имя продавца:", reply_markup=CANCEL_KEYBOARD)
         return SELLER_NAME
     context.user_data["new_order"]["seller"] = value
     order = context.user_data["new_order"]
     summary = (
         "Проверьте заказ перед сохранением:\n\n"
-        f"Дата: {order['date']}\n"
-        f"Номер точки: {order['outlet_number']}\n"
-        f"Адрес: {order['outlet_address']}\n"
-        f"Серийный номер SIM: {order['sim_serial']}\n"
-        f"Номер телефона SIM: {order['sim_phone']}\n"
-        f"Сумма: {order['amount']}\n"
+        f"Дата: {order['date']}\nНомер точки: {order['outlet_number']}\n"
+        f"Адрес: {order['outlet_address']}\nСерийный номер SIM: {order['sim_serial']}\n"
+        f"Номер телефона SIM: {order['sim_phone']}\nСумма: {order['amount']}\n"
         f"Продавец: {order['seller']}"
     )
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Сохранить заказ", callback_data="order:save"),
-            InlineKeyboardButton("❌ Отменить", callback_data="order:cancel"),
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Сохранить заказ", callback_data="order:save"),
+        InlineKeyboardButton("❌ Отменить", callback_data="order:cancel"),
+    ]])
     await update.message.reply_text(summary, reply_markup=ReplyKeyboardRemove())
     await update.message.reply_text("Сохранить этот заказ?", reply_markup=keyboard)
     return CONFIRM_ORDER
@@ -310,36 +283,22 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "order:cancel":
         context.user_data.pop("new_order", None)
         await query.edit_message_text("Заказ отменён.")
-        await query.message.reply_text(
-            "Выберите действие:",
-            reply_markup=get_main_keyboard(query.from_user.id),
-        )
+        await query.message.reply_text("Выберите действие:", reply_markup=get_main_keyboard(query.from_user.id))
         return ConversationHandler.END
 
     order = context.user_data.get("new_order")
     if not order:
-        await query.edit_message_text("Данные заказа не найдены. Начните заново через «➕ Добавить заказ».")
+        await query.edit_message_text("Данные заказа не найдены. Начните заново.")
         return ConversationHandler.END
-
     values = [
-        order["date"],
-        order["outlet_number"],
-        order["outlet_address"],
-        order["sim_serial"],
-        order["sim_phone"],
-        order["amount"],
-        order["seller"],
-        order["telegram_id"],
-        order["created_at"],
+        order["date"], order["outlet_number"], order["outlet_address"],
+        order["sim_serial"], order["sim_phone"], order["amount"], order["seller"],
+        order["telegram_id"], order["created_at"],
     ]
     order_id = append_order(values)
     await query.edit_message_text(f"✅ Заказ №{order_id} сохранён в Excel.")
     context.user_data.pop("new_order", None)
-    await query.message.reply_text(
-        "Выберите действие:",
-        reply_markup=get_main_keyboard(query.from_user.id),
-    )
-
+    await query.message.reply_text("Выберите действие:", reply_markup=get_main_keyboard(query.from_user.id))
     for admin_id in ADMIN_IDS:
         if admin_id != query.from_user.id:
             try:
@@ -353,21 +312,16 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def recent_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
         return
     rows = read_orders()
     if not rows:
         await update.message.reply_text("Пока заказов нет.", reply_markup=ADMIN_KEYBOARD)
         return
-    chunks = []
-    for row in rows[-10:][::-1]:
-        chunks.append(format_order(row))
-    # Telegram message length limit safety
-    message = "\n\n──────────\n\n".join(chunks)
-    for start_idx in range(0, len(message), 3800):
-        await update.message.reply_text(message[start_idx:start_idx + 3800], reply_markup=ADMIN_KEYBOARD)
+    message = "\n\n──────────\n\n".join(format_order(row) for row in rows[-10:][::-1])
+    for i in range(0, len(message), 3800):
+        await update.message.reply_text(message[i:i + 3800], reply_markup=ADMIN_KEYBOARD)
 
 
 async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,23 +330,17 @@ async def export_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     ensure_workbook()
     with open(EXCEL_FILE, "rb") as file:
-        await update.message.reply_document(
-            document=file,
-            filename=os.path.basename(EXCEL_FILE),
-            caption="Файл со всеми заказами.",
-        )
+        await update.message.reply_document(document=file, filename=os.path.basename(EXCEL_FILE), caption="Файл со всеми заказами.")
 
 
 async def clear_orders_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Очищать заказы могут только администраторы.")
         return
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Да, удалить все", callback_data="clear:yes"),
-            InlineKeyboardButton("Нет, отмена", callback_data="clear:no"),
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, удалить все", callback_data="clear:yes"),
+        InlineKeyboardButton("Нет, отмена", callback_data="clear:no"),
+    ]])
     await update.message.reply_text(
         "⚠️ Вы уверены, что хотите удалить ВСЕ заказы из Excel? Это действие нельзя отменить.",
         reply_markup=keyboard,
@@ -424,10 +372,12 @@ async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "➕ Добавить заказ":
         await begin_order(update, context)
     else:
-        await update.message.reply_text(
-            "Выберите действие на клавиатуре ниже.",
-            reply_markup=get_main_keyboard(user_id),
-        )
+        await update.message.reply_text("Выберите действие на клавиатуре ниже.", reply_markup=get_main_keyboard(user_id))
+
+
+async def cancel_text_during_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Dedicated handler inside every state, so the reply-keyboard cancel button always ends the form.
+    return await cancel(update, context)
 
 
 def main():
@@ -440,16 +390,43 @@ def main():
             MessageHandler(filters.Regex(r"^➕ Добавить заказ$"), begin_order),
         ],
         states={
-            ORDER_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_date)],
-            OUTLET_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, outlet_number)],
-            OUTLET_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, outlet_address)],
-            SIM_SERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, sim_serial)],
-            SIM_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sim_phone)],
-            ORDER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_amount)],
-            SELLER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, seller_name)],
-            CONFIRM_ORDER: [CallbackQueryHandler(confirm_order, pattern=r"^order:(save|cancel)$")],
+            ORDER_DATE: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_date),
+            ],
+            OUTLET_NUMBER: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, outlet_number),
+            ],
+            OUTLET_ADDRESS: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, outlet_address),
+            ],
+            SIM_SERIAL: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sim_serial),
+            ],
+            SIM_PHONE: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sim_phone),
+            ],
+            ORDER_AMOUNT: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_amount),
+            ],
+            SELLER_NAME: [
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, seller_name),
+            ],
+            CONFIRM_ORDER: [
+                CallbackQueryHandler(confirm_order, pattern=r"^order:(save|cancel)$"),
+                MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(r"^❌ Отмена$"), cancel_text_during_form),
+        ],
         allow_reentry=True,
     )
 
